@@ -1,4 +1,4 @@
-_target_: diffusion_policy.workspace.train_diffusion_transformer_hybrid_workspace.TrainDiffusionTransformerHybridWorkspace
+_target_: diffusion_policy.workspace.train_nsde_transformer_hybrid_workspace.TrainNSDETransformerHybridWorkspace
 checkpoint:
   save_last_ckpt: true
   save_last_snapshot: false
@@ -27,21 +27,21 @@ keypoint_visible_rate: 1.0
 logging:
   group: null
   id: null
-  mode: disabled
-  name: 2023.01.16-20.20.50_train_diffusion_transformer_hybrid_pusht_image
-  project: diffusion_policy_debug
+  mode: offline
+  name: 2025.07.11-10.20.50_train_nsde_transformer_pusht_image
+  project: nsde_policy_debug
   resume: true
   tags:
-  - train_diffusion_transformer_hybrid
+  - train_nsde_transformer_hybrid
   - pusht_image
   - default
 multi_run:
-  run_dir: data/outputs/2023.01.16/20.20.50_train_diffusion_transformer_hybrid_pusht_image
-  wandb_name_base: 2023.01.16-20.20.50_train_diffusion_transformer_hybrid_pusht_image
+  run_dir: data/outputs/2025.07.11/10.20.50_train_nsde_transformer_pusht_image
+  wandb_name_base: 2025.07.11-10.20.50_train_nsde_transformer_pusht_image
 n_action_steps: 8
 n_latency_steps: 0
 n_obs_steps: 2
-name: train_diffusion_transformer_hybrid
+name: train_nsde_transformer_hybrid
 obs_as_cond: true
 optimizer:
   betas:
@@ -52,7 +52,7 @@ optimizer:
   transformer_weight_decay: 0.001
 past_action_visible: false
 policy:
-  _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
+  _target_: diffusion_policy.policy.nsde_transformer_hybrid_image_policy.NSDETransformerHybridImagePolicy
   causal_attn: true
   crop_shape:
   - 84
@@ -65,16 +65,7 @@ policy:
   n_head: 4
   n_layer: 8
   n_obs_steps: 2
-  noise_scheduler:
-    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
-    beta_end: 0.02
-    beta_schedule: squaredcos_cap_v2
-    beta_start: 0.0001
-    clip_sample: true
-    num_train_timesteps: 100
-    prediction_type: epsilon
-    variance_type: fixed_small
-  num_inference_steps: 100
+  num_inference_steps: 1
   obs_as_cond: true
   obs_encoder_group_norm: true
   p_drop_attn: 0.3
@@ -83,14 +74,14 @@ policy:
   f_ckpt_path: ''
   d_ckpt_path: ''
   g_ckpt_path: ''
-  delta_t: 1.0
+  delta_t: 0.1
   logit_range:
   - -10
   - -1
   func_type: 'f'
   denoising_magnitude: 1.0
   diffusion_magnitide: 1.0
-  noise_std: 0.02
+  noise_std: 0.01
   shape_meta:
     action:
       shape:
@@ -106,7 +97,7 @@ policy:
         - 96
         - 96
         type: rgb
-  time_as_cond: false
+  time_as_cond: true
 shape_meta:
   action:
     shape:
@@ -144,7 +135,7 @@ task:
     n_test_vis: 4
     n_train: 6
     n_train_vis: 2
-    past_action: false
+    past_action: true
     test_start_seed: 100000
     train_start_seed: 0
   image_shape:

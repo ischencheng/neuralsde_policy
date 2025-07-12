@@ -27,7 +27,7 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
             horizon, 
             n_action_steps, 
             n_obs_steps,
-            num_inference_steps=None,
+            num_inference_steps=1,
             # image
             crop_shape=(76, 76),
             obs_encoder_group_norm=False,
@@ -43,22 +43,17 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
             time_as_cond=False,
             obs_as_cond=False,
             # sde model
-            func_type :str='f',
+            func_type :str=None,
             f_ckpt_path: Optional[str] = None,
             d_ckpt_path: Optional[str] = None,
             denoising_magnitude=1.0,
             diffusion_magnitide=1.0,
-            noise_std=0.02,
+            noise_std=0.01,
             logit_range=(-10,-1),
             delta_t=1.0,
             # parameters passed to step
             **kwargs):
         super().__init__()
-
-
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.dtype = torch.long
-
         # parse shape_meta
         action_shape = shape_meta['action']['shape']
         assert len(action_shape) == 1
@@ -154,7 +149,7 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
         model_kwargs = {
             "input_dim": input_dim,
             "output_dim": output_dim,
-            "horizon": horizon,
+            "horizon": n_obs_steps,
             "n_obs_steps": n_obs_steps,
             "cond_dim": cond_dim,
             "n_layer": n_layer,
@@ -220,6 +215,7 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
         self.obs_as_cond = obs_as_cond
         self.delta_t = delta_t
         self.kwargs = kwargs
+        self.noise_std = noise_std
         # create sde model
         self.sde_model = NeuralSDE(
             flow=self.f_model,
@@ -228,8 +224,9 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
             denoiser=self.d_model,
             denoising_magnitude=torch.tensor(denoising_magnitude,dtype=self.dtype,device=self.device),
             diffusion_magnitide=torch.tensor(diffusion_magnitide,dtype=self.dtype,device=self.device),
-            state_shape=(1,horizon-1,input_dim),
+            state_shape=(n_obs_steps,input_dim),
             noise_std=torch.tensor(noise_std,dtype=self.dtype,device=self.device),
+            delta_t=self.delta_t,
         )
 
         # if num_inference_steps is None:
@@ -247,11 +244,11 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
         sde_model.cond=cond
         trajectory = condition_data
         for i in range(self.horizon-self.n_obs_steps):
-            y0=trajectory[:,-2:]
+            y0=trajectory[:,-2:].flatten(start_dim=1)
             states = torchsde.sdeint(
                 sde=sde_model,
                 y0=y0,
-                ts=torch.linspace(i,(i+1)*self.delta_t,2).to(y0.device),
+                ts=torch.linspace(i*self.delta_t,(i+1)*self.delta_t,self.num_inference_steps+1).to(y0.device),
                 method="milstein",  # 'srk', 'euler', 'milstein', etc.
                 dt=1e0,
                 adaptive=False,
@@ -259,7 +256,9 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
                 atol=1e-2,
                 dt_min=1e-10,
             )
-            trajectory = torch.cat([trajectory,states[:,-1]],dim=1)
+            states=rearrange(states, "t b (o d) -> b t o d", o=sde_model.state_shape[0]).contiguous()
+            trajectory = torch.cat([trajectory,states[:,-1,-1:].clamp(-1,1)],dim=1)
+
         return trajectory
 
 
@@ -268,13 +267,13 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
         obs_dict: must include "obs" key
         result: must include "action" key
         """
-        assert 'past_action' in obs_dict # not implemented yet
+        assert 'past_action' in obs_dict
         past_action = obs_dict['past_action']
-        #remove past_action from obs_dict
-        obs_dict.pop('past_action')
-        #ensure the key order is past_action, agent_pos, image
+        past_action = self.normalizer['action'].normalize(past_action)
+        obs_dict_for_norm = {k: v for k, v in obs_dict.items() if k != 'past_action'}
+        nobs = self.normalizer.normalize(obs_dict_for_norm)
+    
         # normalize input
-        nobs = self.normalizer.normalize(obs_dict)
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
         T = self.horizon
@@ -383,16 +382,17 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
         cond_data = None
         ds_dt = None
         timesteps = torch.rand(
-            0, 1, 
             (batch_size,), device=nactions.device
-        ).long()
+        )
         timesteps = timesteps * (self.horizon - To)
         #get the integer part of timesteps
         indices = timesteps.int()
-        #create indices for each observation step
-        indices = indices.unsqueeze(1) + torch.arange(To+1, device=indices.device)
         #get the fractional part of timesteps
         tau=timesteps-indices
+        tau = tau.view(-1, 1, 1)
+        #create indices for each observation step
+        indices = indices.unsqueeze(1) + torch.arange(To+1, device=indices.device)
+        indices = indices.long()
 
         if self.obs_as_cond:
             # reshape B, T, ... to B*T
@@ -402,8 +402,10 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
             # reshape back to B, T, Do
             cond = nobs_features.reshape(batch_size, To, -1)
             #get actions for these indices
-            states = torch.gather(nactions, 1, indices)
-            cond_data = tau*states[:,:To] + (1-tau)*states[:,1:To+1]
+            action_dim = nactions.shape[-1]
+            expanded_indices = indices.unsqueeze(-1).expand(-1, -1, action_dim)
+            states = torch.gather(nactions, 1, expanded_indices)
+            cond_data = tau*states[:,:To] + (1.0-tau)*states[:,1:To+1]
             ds_dt = (states[:,1:To+1]-states[:,:To])/self.delta_t
         else:
             # reshape B, T, ... to B*T
@@ -412,13 +414,15 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
             # reshape back to B, T, Do
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
             trajectory = torch.cat([nactions, nobs_features], dim=-1).detach()
-            states = torch.gather(trajectory, 1, indices)
+            traj_dim = trajectory.shape[-1]
+            expanded_indices = indices.unsqueeze(-1).expand(-1, -1, traj_dim)
+            states = torch.gather(trajectory, 1, expanded_indices)
             cond_data = tau*states[:,:To] + (1-tau)*states[:,1:To+1]
             ds_dt = (states[:,1:To+1]-states[:,:To])/self.delta_t
 
         # generate impainting mask
         condition_mask = torch.zeros_like(ds_dt, dtype=torch.bool)
-        condition_mask[:,:To] = True
+        condition_mask[:,:To-1] = True
 
         # Sample noise that we'll add to the images
         noise = torch.randn(cond_data.shape, device=cond_data.device)
@@ -435,7 +439,7 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
             loss = loss * loss_mask.type(loss.dtype)
         elif self.func_type == 'd':
             pred = self.d_model(cond_data, timesteps, cond)
-            target = -noise
+            target = -noise/self.delta_t
             loss = F.mse_loss(pred, target, reduction='none')
             loss = loss * loss_mask.type(loss.dtype)
         elif self.func_type == 'g':

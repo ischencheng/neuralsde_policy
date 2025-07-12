@@ -13,7 +13,8 @@ class NeuralSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
         diffusion_magnitide=1.0,
         state_shape=None,
         noise_std=1.0,
-        latents=None,
+        cond=None,
+        delta_t=0.1,
     ):
         super().__init__(noise_type="diagonal")
         self.flow = flow  # The drift model
@@ -26,8 +27,8 @@ class NeuralSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
         self.noise_std = noise_std
         self.state_shape = state_shape #b,nc,h,w
         self.cond = cond
-        self.cond_data = cond_data
         self.count=0
+        self.delta_t = delta_t
         self.prev_t = 0.0
         self.prev_dt = -1.0
 
@@ -42,20 +43,23 @@ class NeuralSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
         #     self.count+=1
         #     self.prev_dt = t - self.prev_t
         #     self.prev_t = t
-            
-        flow=self.flow(X,t,cond)
+        X=X.reshape(-1,*self.state_shape)
+        flow=self.flow(X,t/self.delta_t,self.cond)
         if self.denoiser:
-            denoise=self.denoiser(X)
+            denoise=self.denoiser(X,t/self.delta_t,self.cond)
             denoise_correction = denoise *self.denoising_magnitude
             flow=flow+denoise_correction
-        return flow
+        return flow.flatten(start_dim=1)
 
     # Diffusion term: g(X)
     @torch.no_grad()
     def g(self, t: torch.Tensor, X: torch.Tensor):
-        diffusion = (torch.tanh(self.diffusion(X, t, self.cond)) + 1.0) * 0.5 \
+        if self.diffusion is None:
+            return torch.zeros_like(X)
+        X=X.reshape(-1,*self.state_shape)
+        diffusion = (torch.tanh(self.diffusion(X, t/self.delta_t, self.cond)) + 1.0) * 0.5 \
             * (self.logit_max - self.logit_min) + self.logit_min
         diffusion=diffusion*self.diffusion_magnitide
-        return diffusion
+        return diffusion.flatten(start_dim=1)
 
     

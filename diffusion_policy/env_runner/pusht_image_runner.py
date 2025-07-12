@@ -176,6 +176,10 @@ class PushTImageRunner(BaseImageRunner):
             # start rollout
             obs = env.reset()
             past_action = None
+            use_nsde = False
+            if self.past_action:
+                past_action = obs['agent_pos']
+                use_nsde = True
             policy.reset()
 
             pbar = tqdm.tqdm(total=self.max_steps, desc=f"Eval PushtImageRunner {chunk_idx+1}/{n_chunks}", 
@@ -186,8 +190,12 @@ class PushTImageRunner(BaseImageRunner):
                 np_obs_dict = dict(obs)
                 if self.past_action and (past_action is not None):
                     # TODO: not tested
-                    np_obs_dict['past_action'] = past_action[
-                        :,-(self.n_obs_steps-1):].astype(np.float32)
+                    if not use_nsde:
+                        np_obs_dict['past_action'] = past_action[
+                            :,-(self.n_obs_steps-1):].astype(np.float32)
+                    else:
+                        np_obs_dict['past_action'] = past_action[
+                            :,-(self.n_obs_steps):].astype(np.float32)
                 
                 # device transfer
                 obs_dict = dict_apply(np_obs_dict, 
