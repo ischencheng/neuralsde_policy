@@ -244,13 +244,13 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
         sde_model.cond=cond
         trajectory = condition_data
         for i in range(self.horizon-self.n_obs_steps):
-            y0=trajectory[:,-2:].flatten(start_dim=1)
+            y0=trajectory[:,-self.n_obs_steps:].flatten(start_dim=1)
             states = torchsde.sdeint(
                 sde=sde_model,
                 y0=y0,
                 ts=torch.linspace(i*self.delta_t,(i+1)*self.delta_t,self.num_inference_steps+1).to(y0.device),
                 method="milstein",  # 'srk', 'euler', 'milstein', etc.
-                dt=1e0,
+                dt=1e0*self.delta_t/2.0,
                 adaptive=False,
                 rtol=1e-10,
                 atol=1e-2,
@@ -317,7 +317,6 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
             cond_data, 
             cond_mask,
             cond=cond,
-            To=To,
             **self.kwargs)
         
         # unnormalize prediction
@@ -425,8 +424,8 @@ class NSDETransformerHybridImagePolicy(BaseImagePolicy):
         condition_mask[:,:To-1] = True
 
         # Sample noise that we'll add to the images
-        noise = torch.randn(cond_data.shape, device=cond_data.device)
-        cond_data = cond_data + noise*self.noise_std
+        noise = torch.randn(cond_data.shape, device=cond_data.device)*self.noise_std
+        cond_data = cond_data + noise
 
         # compute loss mask
         loss_mask = ~condition_mask
