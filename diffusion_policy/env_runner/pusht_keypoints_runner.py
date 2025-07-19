@@ -191,6 +191,12 @@ class PushTKeypointsRunner(BaseLowdimRunner):
             # start rollout
             obs = env.reset()
             past_action = None
+            Do = obs.shape[-1] // 2
+            action_dim = 2
+            use_nsde = False
+            if self.past_action:
+                past_action = obs[...,:self.n_obs_steps,Do-action_dim:Do]
+                use_nsde = True
             policy.reset()
 
             pbar = tqdm.tqdm(total=self.max_steps, desc=f"Eval PushtKeypointsRunner {chunk_idx+1}/{n_chunks}", 
@@ -206,8 +212,13 @@ class PushTKeypointsRunner(BaseLowdimRunner):
                 }
                 if self.past_action and (past_action is not None):
                     # TODO: not tested
-                    np_obs_dict['past_action'] = past_action[
-                        :,-(self.n_obs_steps-1):].astype(np.float32)
+                    if not use_nsde:
+                        np_obs_dict['past_action'] = past_action[
+                            :,-(self.n_obs_steps-1):].astype(np.float32)
+                    else:
+                        np_obs_dict['past_action'] = past_action[
+                            :,-(self.n_obs_steps):].astype(np.float32)
+
                 
                 # device transfer
                 obs_dict = dict_apply(np_obs_dict, 
@@ -257,6 +268,8 @@ class PushTKeypointsRunner(BaseLowdimRunner):
             max_reward = np.max(all_rewards[i])
             max_rewards[prefix].append(max_reward)
             log_data[prefix+f'sim_max_reward_{seed}'] = max_reward
+            # log_data[prefix+f'sim_avg_reward_{seed}'] = np.mean(all_rewards[i])
+            # log_data[prefix+f'sim_reward_std_{seed}'] = np.std(all_rewards[i])
 
             # visualize sim
             video_path = all_video_paths[i]
