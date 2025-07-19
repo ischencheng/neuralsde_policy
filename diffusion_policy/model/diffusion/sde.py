@@ -13,7 +13,8 @@ class NeuralSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
         diffusion_magnitide=1.0,
         state_shape=None,
         noise_std=1.0,
-        cond=None,
+        local_cond=None,
+        global_cond=None,
         delta_t=0.1,
     ):
         super().__init__(noise_type="diagonal")
@@ -26,7 +27,8 @@ class NeuralSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
         self.diffusion_magnitide = diffusion_magnitide  # Scaling factor for diffusion
         self.noise_std = noise_std
         self.state_shape = state_shape #b,nc,h,w
-        self.cond = cond
+        self.local_cond = local_cond
+        self.global_cond = global_cond
         self.count=0
         self.delta_t = delta_t
         self.prev_t = 0.0
@@ -44,9 +46,9 @@ class NeuralSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
         #     self.prev_dt = t - self.prev_t
         #     self.prev_t = t
         X=X.reshape(-1,*self.state_shape)
-        flow=self.flow(X,t/self.delta_t,self.cond)
+        flow=self.flow(X,t/self.delta_t,self.local_cond,self.global_cond)
         if self.denoiser:
-            denoise=self.denoiser(X,t/self.delta_t,self.cond)
+            denoise=self.denoiser(X,t/self.delta_t,self.local_cond,self.global_cond)
             denoise_correction = denoise *self.denoising_magnitude
             flow=flow+denoise_correction
         return flow.flatten(start_dim=1)
@@ -57,7 +59,7 @@ class NeuralSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
         if self.diffusion is None:
             return torch.zeros_like(X)
         X=X.reshape(-1,*self.state_shape)
-        diffusion = (torch.tanh(self.diffusion(X, t/self.delta_t, self.cond)) + 1.0) * 0.5 \
+        diffusion = (torch.tanh(self.diffusion(X, t/self.delta_t, self.local_cond, self.global_cond)) + 1.0) * 0.5 \
             * (self.logit_max - self.logit_min) + self.logit_min
         diffusion=diffusion*self.diffusion_magnitide
         return diffusion.flatten(start_dim=1)
