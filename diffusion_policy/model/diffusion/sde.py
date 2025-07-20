@@ -61,6 +61,7 @@ class NeuralSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
         X=X.reshape(-1,*self.state_shape)
         diffusion = (torch.tanh(self.diffusion(X, t/self.delta_t, self.local_cond, self.global_cond)) + 1.0) * 0.5 \
             * (self.logit_max - self.logit_min) + self.logit_min
+        diffusion = torch.exp(diffusion)
         diffusion=diffusion*self.diffusion_magnitide
         return diffusion.flatten(start_dim=1)
 
