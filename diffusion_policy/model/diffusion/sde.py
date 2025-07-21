@@ -10,7 +10,7 @@ class NeuralSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
         logit_range=None,
         denoiser=None,
         denoising_magnitude=1.0,
-        diffusion_magnitide=1.0,
+        diffusion_magnitude=1.0,
         state_shape=None,
         noise_std=1.0,
         local_cond=None,
@@ -24,7 +24,7 @@ class NeuralSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
         self.logit_max=logit_range[1] if logit_range is not None else None
         self.denoiser = denoiser
         self.denoising_magnitude = denoising_magnitude  # Scaling factor for denoising
-        self.diffusion_magnitide = diffusion_magnitide  # Scaling factor for diffusion
+        self.diffusion_magnitude = diffusion_magnitude  # Scaling factor for diffusion
         self.noise_std = noise_std
         self.state_shape = state_shape #b,nc,h,w
         self.local_cond = local_cond
@@ -62,7 +62,7 @@ class NeuralSDE(torchsde.SDEIto):  # Assuming Ito SDEs are supported by default
         diffusion = (torch.tanh(self.diffusion(X, t/self.delta_t, self.local_cond, self.global_cond)) + 1.0) * 0.5 \
             * (self.logit_max - self.logit_min) + self.logit_min
         diffusion = torch.exp(diffusion)
-        diffusion=diffusion*self.diffusion_magnitide
+        diffusion=diffusion*self.diffusion_magnitude
         return diffusion.flatten(start_dim=1)
 
     
