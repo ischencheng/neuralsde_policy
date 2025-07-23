@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from einops import rearrange, reduce
 import torchsde
 import copy
+from pydrake.all import PiecewisePolynomial
+import numpy as np
 
 from diffusion_policy.model.diffusion.sde import NeuralSDE
 from diffusion_policy.model.common.normalizer import LinearNormalizer
@@ -64,7 +66,6 @@ class NSDEUnetLowdimPolicy(BaseLowdimPolicy):
         self.f_model = None
         self.d_model = None
         self.g_model = None
-        model.horizon=n_obs_steps
         if hasattr(model, 'global_cond_dim'):
             model.global_cond_dim = n_obs_steps*obs_dim
 
@@ -117,7 +118,7 @@ class NSDEUnetLowdimPolicy(BaseLowdimPolicy):
             denoiser=self.d_model,
             denoising_magnitude=denoising_magnitude,
             diffusion_magnitude=diffusion_magnitude,
-            state_shape=(n_obs_steps, input_dim),
+            state_shape=(1,input_dim),
             noise_std=noise_std,
             delta_t=self.delta_t,
             discrete_dims=self.discrete_dims,
@@ -136,7 +137,7 @@ class NSDEUnetLowdimPolicy(BaseLowdimPolicy):
     
     # ========= inference  ============
     def conditional_sample(self, 
-            condition_data, condition_mask,
+            condition_data,
             local_cond=None, global_cond=None,
             generator=None,
             # keyword arguments to scheduler.step
@@ -147,24 +148,22 @@ class NSDEUnetLowdimPolicy(BaseLowdimPolicy):
         sde_model.global_cond = global_cond
 
         trajectory = condition_data
-        for i in range(self.horizon-self.n_obs_steps):
+        for i in range(self.n_obs_steps-1,self.horizon):
             sde_model.timestep=i*self.delta_t
-            y0=trajectory[:,-self.n_obs_steps:].flatten(start_dim=1)
+            y0=trajectory[:,-1:].flatten(start_dim=1)
             states = torchsde.sdeint(
                 sde=sde_model,
                 y0=y0,
                 ts=torch.linspace(i*self.delta_t,(i+1)*self.delta_t,self.num_inference_steps+1).to(y0.device),
-                method="euler",
+                method="milstein",
                 dt=1e0*self.delta_t,
-                adaptive=False,
-                rtol=1e-10,
-                atol=1e-2,
+                adaptive=True,
+                rtol=1e-4,
+                atol=1e-4,
                 dt_min=1e-10,
             )
-            states=rearrange(states, "t b (o d) -> b t o d", o=sde_model.state_shape[0]).contiguous()
-            if self.discrete_dims is not None:
-                states[...,self.discrete_dims]=sde_model.discrete_dims_cache
-            trajectory = torch.cat([trajectory,states[:,-1,-1:].clamp(-1,1)],dim=1)
+            states=rearrange(states, "t b d -> b t d").contiguous()
+            trajectory = torch.cat([trajectory,states[:,-1:].clamp(-1,1)],dim=1)
 
         return trajectory
 
@@ -203,29 +202,22 @@ class NSDEUnetLowdimPolicy(BaseLowdimPolicy):
             local_cond[:,:To] = nobs[:,:To]
             shape = (B, To, Da)
             cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
-            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
             cond_data[:,:To] = past_action[:,:To]
-            cond_mask[:,:To] = True
         elif self.obs_as_global_cond:
             # condition throught global feature
             global_cond = nobs[:,:To].reshape(nobs.shape[0], -1)
             shape = (B, To, Da)
             cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
-            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
             cond_data[:,:To] = past_action[:,:To]
-            cond_mask[:,:To] = True
         else:
             # condition through impainting
             shape = (B, To, Da+Do)
             cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
-            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
             cond_data[:,:To] = torch.cat([past_action[:,:To],nobs[:,:To]],dim=-1)
-            cond_mask[:,:To] = True
 
         # run sampling
         nsample = self.conditional_sample(
             cond_data, 
-            cond_mask,
             local_cond=local_cond,
             global_cond=global_cond,
             **self.kwargs)
@@ -284,101 +276,125 @@ class NSDEUnetLowdimPolicy(BaseLowdimPolicy):
         return optimizer
 
     def compute_loss(self, batch):
-        # normalize input
-        assert 'valid_mask' not in batch
-        nbatch = self.normalizer.normalize(batch)
-        obs = nbatch['obs']
-        action = nbatch['action']
-        
-        batch_size = action.shape[0]
-        To = self.n_obs_steps
+
+        nobs = batch['nobs']
+        naction = batch['naction']
+        ns = batch['ns']
+        dns_dt = batch['dns_dt']
+        t = batch['t']
+        noise = batch['noise']
+        cns = batch['cns']
+        dcns_dt = batch['dcns_dt']
+        cnoise = batch['cnoise']
 
         # handle different ways of passing observation
         local_cond = None
         global_cond = None
-        cond_data = None
+        s = None
         ds_dt = None
-        timesteps = torch.rand(
-            (batch_size,), device=action.device
-        )
-        timesteps = timesteps * (self.horizon - To)
-        #get the integer part of timesteps
-        indices = timesteps.int()
-        #get the fractional part of timesteps
-        tau=timesteps-indices
-        tau = tau.view(-1, 1, 1)
-        #create indices for each observation step
-        indices = indices.unsqueeze(1) + torch.arange(To+1, device=indices.device)
-        indices = indices.long()
 
-        trajectory = action
         if self.obs_as_local_cond:
             # zero out observations after n_obs_steps
-            local_cond = obs
+            local_cond = nobs
             local_cond[:,self.n_obs_steps:,:] = 0
-            action_dim = action.shape[-1]
-            expanded_indices = indices.unsqueeze(-1).expand(-1, -1, action_dim)
-            states = torch.gather(action, 1, expanded_indices)
-            cond_data = tau*states[:,:To] + (1.0-tau)*states[:,1:To+1]
-            ds_dt = (states[:,1:To+1]-states[:,:To])/self.delta_t
-            ds_dt[...,action_dim-1] = states[:,1:To+1,action_dim-1]
-
+            s = ns
+            ds_dt = dns_dt
         elif self.obs_as_global_cond:
-            global_cond = obs[:,:self.n_obs_steps,:].reshape(
-                obs.shape[0], -1)
-            action_dim = action.shape[-1]
-            expanded_indices = indices.unsqueeze(-1).expand(-1, -1, action_dim)
-            states = torch.gather(action, 1, expanded_indices)
-            cond_data = tau*states[:,:To] + (1.0-tau)*states[:,1:To+1]
-            ds_dt = (states[:,1:To+1]-states[:,:To])/self.delta_t
-            ds_dt[...,action_dim-1] = states[:,1:To+1,action_dim-1]
+            global_cond = nobs[:,:self.n_obs_steps,:].reshape(
+                nobs.shape[0], -1)        
+            s = ns
+            ds_dt = dns_dt
         else:
-            trajectory = torch.cat([action, obs], dim=-1).detach()
-            traj_dim = trajectory.shape[-1]
-            expanded_indices = indices.unsqueeze(-1).expand(-1, -1, traj_dim)
-            states = torch.gather(trajectory, 1, expanded_indices)
-            cond_data = tau*states[:,:To] + (1-tau)*states[:,1:To+1]
-            ds_dt = (states[:,1:To+1]-states[:,:To])/self.delta_t
-            ds_dt[...,action_dim-1] = states[:,1:To+1,action_dim-1]
-        
-        # generate impainting mask
-        condition_mask = torch.zeros_like(ds_dt, dtype=torch.bool)
-        if self.func_type == 'f' or self.func_type == 'g':
-            condition_mask[:,:To-1] = True
+            s = cns
+            ds_dt = dcns_dt
+            noise = cnoise
 
-        # Sample noise that we'll add to the images
-        noise = torch.randn(cond_data.shape, device=cond_data.device)*self.noise_std
-        cond_data = cond_data + noise
-
-        # compute loss mask
-        loss_mask = ~condition_mask
         loss = 0.0
         # Predict the noise residual
         if self.func_type == 'f':
             assert self.f_model is not None
-            pred = self.f_model(cond_data, timesteps, local_cond=local_cond, global_cond=global_cond)
+            pred = self.f_model(s, t/self.delta_t, local_cond=local_cond, global_cond=global_cond)
             target = ds_dt
             loss = F.mse_loss(pred, target, reduction='none')
-            loss = loss * loss_mask.type(loss.dtype)
         elif self.func_type == 'd':
             assert self.d_model is not None
-            pred = self.d_model(cond_data, timesteps, local_cond=local_cond, global_cond=global_cond)
+            pred = self.d_model(s, t/self.delta_t, local_cond=local_cond, global_cond=global_cond)
             target = -noise
             loss = F.mse_loss(pred, target, reduction='none')
-            loss = loss * loss_mask.type(loss.dtype)
         elif self.func_type == 'g':
             assert self.g_model is not None
-            pred = self.g_model(cond_data, timesteps, local_cond=local_cond, global_cond=global_cond)
+            pred = self.g_model(s, t/self.delta_t, local_cond=local_cond, global_cond=global_cond)
             with torch.no_grad():
                 assert self.f_model is not None
-                f_pred = self.f_model(cond_data,timesteps,local_cond=local_cond, global_cond=global_cond)
+                f_pred = self.f_model(s,t/self.delta_t,local_cond=local_cond, global_cond=global_cond)
                 target = (ds_dt-f_pred)**2*self.delta_t
             logit_min, logit_max = self.sde_model.logit_min, self.sde_model.logit_max
             scaled_pred = (torch.tanh(pred)+1.0)*0.5*(logit_max-logit_min)+logit_min
             loss = F.mse_loss(torch.exp(scaled_pred), torch.sqrt(target), reduction='none')+\
                 F.mse_loss(scaled_pred, 0.5*torch.log(target+1.0e-6), reduction='none')
-            loss = loss * loss_mask.type(loss.dtype)
 
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
         return loss
+
+    def get_collate_fn(self, normalizer: LinearNormalizer, horizon: int, n_obs_steps: int, noise_std: float, delta_t: float):
+        """
+        Returns a collate function that applies normalization and the transformation.
+        """
+        def collate_fn(batch):
+            # batch is a list of dicts
+            processed_batch = []
+            for sample in batch:
+                # normalize sample
+                n_sample = normalizer.normalize(sample)
+                naction = n_sample['action']
+                nobs = n_sample['obs']
+
+                # PiecewisePolynomial and np.concatenate require numpy arrays
+                if torch.is_tensor(naction):
+                    naction = naction.detach().cpu().numpy()
+                if torch.is_tensor(nobs):
+                    nobs = nobs.detach().cpu().numpy()
+
+                # Create a trajectory from the action sequence.
+                traj_times = np.linspace(0, horizon-1, horizon)*delta_t
+                traj_positions = naction
+                traj = PiecewisePolynomial.FirstOrderHold(
+                    traj_times, traj_positions.T
+                )
+
+                # Sample time and get state/velocity time should be in [n_obs_steps-1, horizon-1]
+
+                time = np.float32((np.random.rand()*(horizon-n_obs_steps) + n_obs_steps-1)*delta_t)
+                ns = traj.value(time).T
+                noise = np.random.randn(*ns.shape)*noise_std
+                ns = ns+noise
+                dns_dt = traj.EvalDerivative(time).T
+                
+                concatenated_traj_positions = np.concatenate([naction, nobs], axis=-1)
+                concatenated_traj = PiecewisePolynomial.FirstOrderHold(
+                    traj_times, concatenated_traj_positions.T
+                )
+                cns = concatenated_traj.value(time).T
+                cnoise = np.random.randn(*cns.shape)*noise_std
+                cns = cns+cnoise
+                dcns_dt = concatenated_traj.EvalDerivative(time).T
+
+                processed_batch.append({
+                    'obs': sample['obs'],
+                    'action': sample['action'], # keep original action
+                    'nobs': nobs,
+                    'naction': naction,
+                    'ns': ns.astype(np.float32),
+                    'dns_dt': dns_dt.astype(np.float32),
+                    'cns': cns.astype(np.float32),
+                    'dcns_dt': dcns_dt.astype(np.float32),
+                    't': time,
+                    'noise': noise.astype(np.float32),
+                    'cnoise': cnoise.astype(np.float32),
+                })
+            
+            # use default_collate to batch the processed samples
+            return torch.utils.data.default_collate(processed_batch)
+        
+        return collate_fn
